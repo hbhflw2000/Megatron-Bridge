@@ -5,17 +5,46 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_DIR=$(cd -- "${SCRIPT_DIR}/../../../.." && pwd -P)
 
 export PYTHONNOUSERSITE=1
+ANACONDA_SITE_PACKAGES=${ANACONDA_SITE_PACKAGES:-/home/luban/anaconda3/lib/python3.11/site-packages}
 export PYTHONPATH="${ROOT_DIR}/src:${ROOT_DIR}/3rdparty/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 
-WORKSPACE=${WORKSPACE:-${ROOT_DIR}/.cache/qwen3_omni_train}
+WORKSPACE=${WORKSPACE:-/nfs/ofs-llab-hdd/users/liuwei/omni/qwen3_omni_train}
 HF_HOME=${HF_HOME:-${WORKSPACE}/hf_home}
 TMPDIR=${TMPDIR:-${WORKSPACE}/tmp}
 RESULTS_DIR=${RESULTS_DIR:-${WORKSPACE}/results}
 LOG_DIR=${LOG_DIR:-${WORKSPACE}/logs}
+LOCAL_PY_SHIM_DIR=${LOCAL_PY_SHIM_DIR:-${WORKSPACE}/py_shims}
 
-mkdir -p "${WORKSPACE}" "${HF_HOME}" "${TMPDIR}" "${RESULTS_DIR}" "${LOG_DIR}"
+mkdir -p "${WORKSPACE}" "${HF_HOME}" "${TMPDIR}" "${RESULTS_DIR}" "${LOG_DIR}" "${LOCAL_PY_SHIM_DIR}"
 
-PYTHON_BIN=${PYTHON_BIN:-python}
+cat > "${LOCAL_PY_SHIM_DIR}/sitecustomize.py" <<'PY'
+"""Local training shims for py311 compatibility and path hygiene."""
+
+import sys
+import typing
+import os
+
+if not hasattr(typing, "override"):
+    from typing_extensions import override as _override
+
+    typing.override = _override
+
+_BLOCKED_SUBSTRINGS = [
+    "/home/luban/.local/lib/python3.11/site-packages",
+]
+
+sys.path[:] = [p for p in sys.path if not any(s in p for s in _BLOCKED_SUBSTRINGS)]
+
+anaconda_site_packages = os.environ.get("ANACONDA_SITE_PACKAGES")
+if anaconda_site_packages and os.path.isdir(anaconda_site_packages) and anaconda_site_packages not in sys.path:
+    sys.path.append(anaconda_site_packages)
+PY
+
+export PYTHONPATH="${LOCAL_PY_SHIM_DIR}:${PYTHONPATH}"
+
+CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX:-/nfs/ml-training-ssd/users/liuwei/condaenv}
+PYTHON_BIN=${PYTHON_BIN:-${CONDA_ENV_PREFIX}/bin/python}
+export PATH="${CONDA_ENV_PREFIX}/bin:${PATH}"
 
 HF_MODEL_PATH=${HF_MODEL_PATH:-}
 THINKER_ONLY_MIRROR_DIR=${THINKER_ONLY_MIRROR_DIR:-${WORKSPACE}/hf_thinker_only}
@@ -74,6 +103,7 @@ USE_PRECISION_AWARE_OPTIMIZER=${USE_PRECISION_AWARE_OPTIMIZER:-}
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-}
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-}
 ALIGN_PARAM_GATHER=${ALIGN_PARAM_GATHER:-}
+MOE_FLEX_DISPATCHER_BACKEND=${MOE_FLEX_DISPATCHER_BACKEND:-}
 USE_PYTORCH_PROFILER=${USE_PYTORCH_PROFILER:-}
 USE_NSYS_PROFILER=${USE_NSYS_PROFILER:-}
 PROFILE_STEP_START=${PROFILE_STEP_START:-}
@@ -333,6 +363,9 @@ fi
 if [[ -n "${ALIGN_PARAM_GATHER}" ]]; then
     CMD+=(ddp.align_param_gather="${ALIGN_PARAM_GATHER}")
 fi
+if [[ -n "${MOE_FLEX_DISPATCHER_BACKEND}" ]]; then
+    CMD+=(model.moe_flex_dispatcher_backend="${MOE_FLEX_DISPATCHER_BACKEND}")
+fi
 if [[ -n "${USE_PYTORCH_PROFILER}" ]]; then
     CMD+=(profiling.use_pytorch_profiler="${USE_PYTORCH_PROFILER}")
 fi
@@ -398,6 +431,7 @@ echo "[info] USE_PRECISION_AWARE_OPTIMIZER=${USE_PRECISION_AWARE_OPTIMIZER}"
 echo "[info] OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE}"
 echo "[info] OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "[info] ALIGN_PARAM_GATHER=${ALIGN_PARAM_GATHER}"
+echo "[info] MOE_FLEX_DISPATCHER_BACKEND=${MOE_FLEX_DISPATCHER_BACKEND}"
 echo "[info] USE_PYTORCH_PROFILER=${USE_PYTORCH_PROFILER}"
 echo "[info] USE_NSYS_PROFILER=${USE_NSYS_PROFILER}"
 echo "[info] PROFILE_STEP_START=${PROFILE_STEP_START}"
@@ -416,7 +450,37 @@ echo "[info] FPS_MAX_FRAMES=${FPS_MAX_FRAMES}"
 echo "[info] PYTHON_BIN=${PYTHON_BIN}"
 echo "[info] PYTHONPATH=${PYTHONPATH}"
 echo "[info] PYTHONNOUSERSITE=${PYTHONNOUSERSITE}"
+echo "[info] ANACONDA_SITE_PACKAGES=${ANACONDA_SITE_PACKAGES}"
 echo "[info] LOG_PATH=${LOG_PATH}"
+
+"${PYTHON_BIN}" - <<'PY'
+import os
+import sys
+
+print("[info] python:", sys.executable)
+print("[info] sys.path:", sys.path)
+try:
+    import megatron
+    print("[info] megatron.__path__:", list(getattr(megatron, "__path__", [])))
+    for candidate in [
+        "/home/luban/anaconda3/lib/python3.11/site-packages/megatron",
+        "/home/luban/anaconda3/lib/python3.11/site-packages/megatron/energon",
+        "/home/luban/anaconda3/lib/python3.11/site-packages/megatron/energon/__init__.py",
+        "/nfs/ml-training-ssd/users/liuwei/condaenv/lib/python3.11/site-packages/megatron",
+        "/nfs/ml-training-ssd/users/liuwei/condaenv/lib/python3.11/site-packages/megatron/energon",
+        "/nfs/ml-training-ssd/users/liuwei/condaenv/lib/python3.11/site-packages/megatron/energon/__init__.py",
+    ]:
+        print(f"[info] exists({candidate})={os.path.exists(candidate)}")
+    import megatron.energon
+    print("[info] energon: ok")
+    import transformer_engine
+    print("[info] transformer_engine:", transformer_engine.__file__)
+    from importlib.metadata import version
+    print("[info] transformer_engine.version:", version("transformer-engine"))
+except Exception as e:
+    print("[error] energon import failed:", repr(e))
+    raise
+PY
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     printf '[dry-run] %q ' "${CMD[@]}"

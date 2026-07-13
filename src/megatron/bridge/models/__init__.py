@@ -35,11 +35,18 @@ from megatron.bridge.models.deepseek import (
 from megatron.bridge.models.ernie import (
     Ernie45Bridge,
 )
-from megatron.bridge.models.ernie_vl import (
-    Ernie45VLBridge,
-    Ernie45VLModel,
-    Ernie45VLModelProvider,
-)
+try:
+    from megatron.bridge.models.ernie_vl import (
+        Ernie45VLBridge,
+        Ernie45VLModel,
+        Ernie45VLModelProvider,
+    )
+except ModuleNotFoundError as exc:
+    if "ernie4_5_vl_moe" not in str(exc):
+        raise
+    Ernie45VLBridge = None
+    Ernie45VLModel = None
+    Ernie45VLModelProvider = None
 from megatron.bridge.models.exaone import (
     Exaone4Bridge,
 )
@@ -64,9 +71,14 @@ from megatron.bridge.models.glm import (
     GLM45Bridge,
     GLM47FlashBridge,
 )
-from megatron.bridge.models.glm_moe_dsa import (
-    GLM5Bridge,
-)
+try:
+    from megatron.bridge.models.glm_moe_dsa import (
+        GLM5Bridge,
+    )
+except ImportError as exc:
+    if "GlmMoeDsaForCausalLM" not in str(exc):
+        raise
+    GLM5Bridge = None
 from megatron.bridge.models.glm_vl import (
     GLM45VBridge,
     GLM45VModelProvider,

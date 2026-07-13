@@ -16,4 +16,10 @@ from megatron.bridge.models.qwen.qwen2_bridge import Qwen2Bridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge  # noqa: F401
 from megatron.bridge.models.qwen.qwen3_next_bridge import Qwen3NextBridge  # noqa: F401
-from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge  # noqa: F401
+try:
+    from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge  # noqa: F401
+except ImportError as exc:
+    if "Qwen3_5" not in str(exc):
+        raise
+    Qwen35Bridge = None
+    Qwen35MoEBridge = None

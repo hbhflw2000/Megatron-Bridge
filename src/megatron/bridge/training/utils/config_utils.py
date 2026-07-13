@@ -27,7 +27,10 @@ from megatron.training.config.utils import (
 from megatron.training.config.utils import (
     sanitize_dataclass_config as _sanitize_dataclass_config,
 )
-from transformers import PreTrainedConfig
+try:
+    from transformers import PreTrainedConfig
+except ImportError:  # transformers v4 exposes the class as PretrainedConfig.
+    from transformers import PretrainedConfig as PreTrainedConfig
 
 
 logger = logging.getLogger(__name__)

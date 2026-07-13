@@ -17,7 +17,11 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from transformers import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+try:
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+except ImportError:
+    Qwen3_5ForCausalLM = "Qwen3_5ForCausalLM"
+    Qwen3_5MoeForCausalLM = "Qwen3_5MoeForCausalLM"
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge

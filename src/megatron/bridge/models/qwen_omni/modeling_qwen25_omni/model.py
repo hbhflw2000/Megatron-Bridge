@@ -51,6 +51,9 @@ class Qwen25OmniModel(MegatronModule):
     ) -> None:
         super().__init__(config=language_transformer_config)
 
+        self.pre_process = pre_process
+        self.post_process = post_process
+
         self.thinker = Qwen25OmniThinkerModel(
             language_transformer_config,
             language_transformer_layer_spec,
@@ -62,6 +65,8 @@ class Qwen25OmniModel(MegatronModule):
             add_decoder,
             pg_collection,
         )
+
+        self.share_embeddings_and_output_weights = self.thinker.share_embeddings_and_output_weights
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is

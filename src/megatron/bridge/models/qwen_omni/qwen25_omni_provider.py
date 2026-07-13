@@ -24,8 +24,19 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch.nn.functional as F
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
+from megatron.core.transformer.enums import AttnBackend
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniTalkerConfig,
     Qwen2_5OmniThinkerConfig,
@@ -112,18 +123,43 @@ class Qwen25OmniModelProvider(GPTModelProvider):
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None):
         """Provide a Qwen2.5 Omni model instance with vision, audio, and language components."""
+        pp_group = self._pg_collection.pp if self._pg_collection is not None else None
+        vp_size = self.virtual_pipeline_model_parallel_size
+        if pre_process is None:
+            pre_process = (
+                is_vp_first_stage(vp_stage=vp_stage, vp_size=vp_size) and is_pp_first_stage(pp_group)
+                if pp_group is not None
+                else True
+            )
+        if post_process is None:
+            post_process = (
+                is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_pp_last_stage(pp_group)
+                if pp_group is not None
+                else True
+            )
+
         language_transformer_config = self
         thinker_config = self.thinker_config
         talker_config = self.talker_config
         token2wav_config = self.token2wav_config
 
-        # Dense GPT layer spec (no MoE, no QK layernorm for Qwen2)
-        language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
-            qk_layernorm=self.qk_layernorm,
-            fp8=False,
-        )
+        # Dense GPT layer spec (no MoE, no QK layernorm for Qwen2).
+        use_local_attention = self.attention_backend in {AttnBackend.local, "local"}
+        if HAVE_TE and not use_local_attention:
+            language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=None,
+                moe_grouped_gemm=False,
+                qk_layernorm=self.qk_layernorm,
+                fp8=False,
+            )
+        else:
+            self.persist_layer_norm = False
+            language_transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=None,
+                moe_grouped_gemm=False,
+                qk_layernorm=self.qk_layernorm,
+                normalization=self.normalization,
+            )
 
         model = Qwen25OmniModel(
             language_transformer_config=language_transformer_config,

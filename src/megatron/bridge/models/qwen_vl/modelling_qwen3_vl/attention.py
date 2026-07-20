@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+import torch
 from einops import rearrange
 from megatron.core.transformer.attention import (
     HAVE_FA3,
@@ -24,9 +27,16 @@ from megatron.core.transformer.attention import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from torch import Tensor
 
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import apply_rotary_pos_emb_absolute
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention_audit import (
+    capture_attention_execution,
+    capture_attention_stage,
+    qwen_valid_mask_to_te_mask,
+)
 
 
 class Qwen3VLSelfAttention(SelfAttention):
@@ -34,6 +44,26 @@ class Qwen3VLSelfAttention(SelfAttention):
     Overrides the SelfAttention class, the difference is that qwen3vl uses apply_rotary_pos_emb_absolute
     instead of apply_rotary_pos_emb
     """
+
+    @staticmethod
+    def _local_causal_attention(query: Tensor, key: Tensor, value: Tensor, scale: float) -> Tensor:
+        """Causal attention fallback for local padded fixed-score paths."""
+        if query.shape[2] != key.shape[2]:
+            if query.shape[2] % key.shape[2] != 0:
+                raise ValueError(f"Query heads ({query.shape[2]}) must be divisible by key heads ({key.shape[2]}).")
+            repeat = query.shape[2] // key.shape[2]
+            key = key.repeat_interleave(repeat, dim=2)
+            value = value.repeat_interleave(repeat, dim=2)
+
+        scores = torch.einsum("sbhd,tbhd->bhst", query.to(torch.float32), key.to(torch.float32)) * scale
+        sq, sk = scores.shape[-2], scores.shape[-1]
+        if sq > 1:
+            causal_mask = torch.ones((sq, sk), dtype=torch.bool, device=scores.device).triu(1 + max(sk - sq, 0))
+            scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+
+        probs = torch.softmax(scores, dim=-1).to(value.dtype)
+        context = torch.einsum("bhst,tbhd->sbhd", probs, value)
+        return context.reshape(context.shape[0], context.shape[1], -1).contiguous()
 
     def forward(
         self,
@@ -110,6 +140,9 @@ class Qwen3VLSelfAttention(SelfAttention):
         else:
             query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
         nvtx_range_pop(suffix="qkv")
+        capture_attention_stage(self.layer_number, "q_post_qk_norm", query)
+        capture_attention_stage(self.layer_number, "k_post_qk_norm", key)
+        capture_attention_stage(self.layer_number, "v_pre_attention", value)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -182,6 +215,8 @@ class Qwen3VLSelfAttention(SelfAttention):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if q_pos_emb is not None:
+                capture_attention_stage(self.layer_number, "q_pre_rope", query)
+                capture_attention_stage(self.layer_number, "q_rope_freq", q_pos_emb)
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
                     query = apply_rotary_pos_emb_absolute(
@@ -198,13 +233,17 @@ class Qwen3VLSelfAttention(SelfAttention):
                         cu_seqlens_q,
                         self.model_comm_pgs.cp,
                     )
+                capture_attention_stage(self.layer_number, "q_post_rope", query)
             if k_pos_emb is not None:
+                capture_attention_stage(self.layer_number, "k_pre_rope", key)
+                capture_attention_stage(self.layer_number, "k_rope_freq", k_pos_emb)
                 key = apply_rotary_pos_emb_absolute(
                     key,
                     k_pos_emb,
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                 )
+                capture_attention_stage(self.layer_number, "k_post_rope", key)
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -217,12 +256,68 @@ class Qwen3VLSelfAttention(SelfAttention):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
-        if self.checkpoint_core_attention and self.training:
+        use_local_causal_attention = (
+            isinstance(self.core_attention, DotProductAttention)
+            and packed_seq_params is None
+            and attention_bias is None
+            and (inference_context is None or inference_context.is_static_batching())
+        )
+        # Qwen's BSHD path uses True=valid while TE uses True=masked.
+        # Normalize only the non-packed BSHD convention before invoking TE.
+        normalize_te_valid_mask = (
+            isinstance(self.core_attention, TEDotProductAttention)
+            and packed_seq_params is None
+            and isinstance(attention_mask, Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.dtype == torch.bool
+        )
+        core_attention_mask = (
+            qwen_valid_mask_to_te_mask(attention_mask) if normalize_te_valid_mask else attention_mask
+        )
+        capture_attention_execution(
+            self.layer_number,
+            core_attention=self.core_attention,
+            path=(
+                "local_causal_fallback"
+                if use_local_causal_attention
+                else "core_attention_normalized_valid_mask"
+                if normalize_te_valid_mask
+                else "core_attention"
+            ),
+            packed_seq_params=packed_seq_params,
+            attention_bias=attention_bias,
+            inference_context=inference_context,
+            attention_mask=core_attention_mask,
+            query=query,
+            key=key,
+            value=value,
+        )
+        capture_local_reference = (
+            os.getenv("VERL_OMNI_MEGATRON_ATTENTION_LOCAL_REFERENCE", "0") == "1"
+            and packed_seq_params is None
+            and attention_bias is None
+            and inference_context is None
+            and (
+                attention_mask is None
+                or (attention_mask.ndim == 2 and bool(attention_mask.detach().all().item()))
+            )
+        )
+        if capture_local_reference:
+            scale = getattr(self.core_attention, "softmax_scale", None)
+            scale = float(query.shape[-1] ** -0.5 if scale is None else scale)
+            with torch.no_grad():
+                local_reference = self._local_causal_attention(query.detach(), key.detach(), value.detach(), scale)
+            capture_attention_stage(self.layer_number, "local_causal_reference_context", local_reference)
+        if use_local_causal_attention:
+            scale = getattr(self.core_attention, "softmax_scale", None)
+            scale = float(query.shape[-1] ** -0.5 if scale is None else scale)
+            core_attn_out = self._local_causal_attention(query, key, value, scale)
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
                 value,
-                attention_mask,
+                core_attention_mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
@@ -234,7 +329,7 @@ class Qwen3VLSelfAttention(SelfAttention):
                     query,
                     key,
                     value,
-                    attention_mask,
+                    core_attention_mask,
                     attn_mask_type=attn_mask_type,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
@@ -267,6 +362,7 @@ class Qwen3VLSelfAttention(SelfAttention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+        capture_attention_stage(self.layer_number, "attention_context", core_attn_out)
 
         # Output gate (for Gated Attention in hybrid architectures like Qwen3.5)
         if gate is not None:
@@ -279,5 +375,6 @@ class Qwen3VLSelfAttention(SelfAttention):
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
         nvtx_range_pop(suffix="linear_proj")
+        capture_attention_stage(self.layer_number, "attention_projection_output", output)
 
         return output, bias

@@ -64,9 +64,15 @@ from megatron.bridge.models.glm import (
     GLM45Bridge,
     GLM47FlashBridge,
 )
-from megatron.bridge.models.glm_moe_dsa import (
-    GLM5Bridge,
-)
+try:
+    from megatron.bridge.models.glm_moe_dsa import (
+        GLM5Bridge,
+    )
+
+    _OPTIONAL_EXPORTS = ["GLM5Bridge"]
+except ImportError:
+    GLM5Bridge = None
+    _OPTIONAL_EXPORTS = []
 from megatron.bridge.models.glm_vl import (
     GLM45VBridge,
     GLM45VModelProvider,
@@ -196,7 +202,7 @@ __all__ = [
     "Gemma2ModelProvider27B",
     "GLM45Bridge",
     "GLM47FlashBridge",
-    "GLM5Bridge",
+    *_OPTIONAL_EXPORTS,
     "GLM45VBridge",
     "GLM45VModelProvider",
     "GPTModelProvider",

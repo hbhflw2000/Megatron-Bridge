@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -32,6 +34,7 @@ from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.rope import get_rope_i
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.transformer_config import (
     Qwen3OmniTransformerConfig,
 )
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     split_data_cp_rank,
@@ -62,6 +65,27 @@ def _build_text_only_mrope_position_ids(input_ids: torch.Tensor) -> torch.Tensor
     base = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
     base = base.unsqueeze(0).expand(batch_size, -1)
     return torch.stack([base, base, base], dim=0)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _scatter_position_ids_to_sequence_parallel_region(position_ids: torch.Tensor) -> torch.Tensor:
+    """Scatter mRoPE position ids along sequence dim to match SP-sharded hidden states."""
+    if position_ids.ndim == 2:
+        # [batch, seq] -> [seq, batch] -> [batch, local_seq]
+        position_ids_t = position_ids.transpose(0, 1).contiguous()
+        position_ids_t = tensor_parallel.scatter_to_sequence_parallel_region(position_ids_t)
+        return position_ids_t.transpose(0, 1).contiguous()
+
+    if position_ids.ndim == 3:
+        # [3, batch, seq] -> [seq, 3, batch] -> [3, batch, local_seq]
+        position_ids_t = position_ids.permute(2, 0, 1).contiguous()
+        position_ids_t = tensor_parallel.scatter_to_sequence_parallel_region(position_ids_t)
+        return position_ids_t.permute(1, 2, 0).contiguous()
+
+    raise ValueError(f"Unsupported Qwen3-Omni position_ids shape for SP scatter: {tuple(position_ids.shape)}")
 
 
 def _configure_multimodal_attn_impl(config: object, attn_impl: str | None) -> None:
@@ -214,6 +238,9 @@ class Qwen3OmniThinkerModel(MegatronModule):
             if getattr(language_transformer_config, "vit_gradient_checkpointing", False):
                 _enable_multimodal_gradient_checkpointing(self.visual)
                 _enable_multimodal_gradient_checkpointing(self.audio_model)
+
+        if hasattr(language_transformer_layer_spec, "submodules"):
+            language_transformer_layer_spec.submodules.self_attention.module = Qwen3VLSelfAttention
 
         self.language_model = Qwen3VLGPTModel(
             config=language_transformer_config,
@@ -553,6 +580,13 @@ class Qwen3OmniThinkerModel(MegatronModule):
 
         if sp_pad_len > 0 and position_ids is not None:
             position_ids = torch.nn.functional.pad(position_ids, (0, sp_pad_len), mode="replicate")
+
+        if (
+            position_ids is not None
+            and self.config.sequence_parallel
+            and _env_flag("VERL_OMNI_QWEN3_OMNI_SP_SCATTER_POSITION_IDS")
+        ):
+            position_ids = _scatter_position_ids_to_sequence_parallel_region(position_ids)
 
         if self.config.sequence_parallel or cp_size > 1:
             visual_pos_masks, deepstack_visual_embeds = split_deepstack_embs(

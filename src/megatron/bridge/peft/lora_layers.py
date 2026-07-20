@@ -12,16 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
 from typing import Any, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
 from megatron.core.transformer.moe.moe_utils import apply_random_logits
 
 from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
 from megatron.bridge.utils.import_utils import safe_import
+
+
+try:
+    import transformer_engine.pytorch as te
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+    class _MissingTEBase(nn.Module):
+        def __init__(self, *args, **kwargs):
+            raise ImportError("TransformerEngine is required for TransformerEngine LoRA layers.")
+
+    class _MissingTEOps:
+        def __getattr__(self, name):
+            raise ImportError("TransformerEngine is required for TransformerEngine LoRA op fusion.")
+
+    class _MissingTE:
+        Linear = _MissingTEBase
+        LayerNormLinear = _MissingTEBase
+        ops = _MissingTEOps()
+
+        @staticmethod
+        def fp8_autocast(*args, **kwargs):
+            raise ImportError("TransformerEngine is required for TransformerEngine LoRA op fusion.")
+
+    te = _MissingTE()
 
 
 if torch.cuda.is_available():
@@ -78,7 +106,7 @@ class LoRATopKRouter(AdapterWrapper):
         return self.to_wrap.routing(logits, *args, **kwargs)
 
 
-class TELinearAdapter(te.Linear):
+class TELinearAdapter(te.Linear if HAVE_TE else nn.Module):
     """
     TELinear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN)
 
@@ -118,6 +146,8 @@ class TELinearAdapter(te.Linear):
             lora_A_init_method: Initialization method for LoRA matrix A.
             lora_dtype: Data type for LoRA weights.
         """
+        if not HAVE_TE:
+            raise ImportError("TransformerEngine is required for TELinearAdapter.")
         assert orig_linear.__class__ == te.Linear
         # TELinear has bias set to empty tensor
         has_bias = orig_linear.bias is not None and orig_linear.bias.shape[0] != 0
@@ -232,6 +262,8 @@ class TEFusedLoRALinear(LoRALinear):
     """LoRA adapter wrapper using Transformer Engine operation fuser"""
 
     def __init__(self, to_wrap: nn.Module, adapter: nn.Module):
+        if not HAVE_TE:
+            raise ImportError("TransformerEngine is required for TEFusedLoRALinear.")
         super().__init__(to_wrap, adapter)
         self._fused_branches: Optional[tuple[te.ops.Sequential, te.ops.Sequential]] = None
 
@@ -679,14 +711,15 @@ def patch_linear_module(
         NotImplementedError: If orig_linear is not nn.Linear or te.Linear.
         AssertionError: If orig_linear already has super_fwd attribute.
     """
-    assert isinstance(orig_linear, nn.Linear) or (orig_linear.__class__ == te.Linear)
+    is_te_linear = HAVE_TE and orig_linear.__class__ == te.Linear
+    assert isinstance(orig_linear, nn.Linear) or is_te_linear
     assert not hasattr(orig_linear, "super_fwd"), orig_linear.super_fwd
 
     if isinstance(orig_linear, nn.Linear):
         LinearAdapter._init_adapter(orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype)
         cls = orig_linear.__class__
         new_cls = type("PatchedLinearAdapter", (LinearAdapter, cls), {})
-    elif orig_linear.__class__ == te.Linear:
+    elif is_te_linear:
         TELinearAdapter._init_adapter(
             orig_linear, dim, alpha, dropout, dropout_position, lora_A_init_method, lora_dtype
         )

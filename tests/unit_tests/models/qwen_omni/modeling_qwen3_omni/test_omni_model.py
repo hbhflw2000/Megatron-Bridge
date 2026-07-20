@@ -35,7 +35,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.model import Qwen3OmniModel
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.rope import get_rope_index
-from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.thinker_model import _trim_feature_sequence
+from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.thinker_model import (
+    _scatter_position_ids_to_sequence_parallel_region,
+    _trim_feature_sequence,
+)
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.transformer_config import (
     Qwen3OmniTransformerConfig,
 )
@@ -99,6 +102,42 @@ def _make_toy_thinker_config():
 @pytest.fixture(scope="module")
 def thinker_config():
     return _make_toy_thinker_config()
+
+
+def test_scatter_position_ids_2d_matches_sequence_parallel_layout(monkeypatch):
+    def _fake_scatter(x):
+        return x[::2].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.bridge.models.qwen_omni.modeling_qwen3_omni.thinker_model.tensor_parallel.scatter_to_sequence_parallel_region",
+        _fake_scatter,
+    )
+
+    position_ids = torch.arange(12).view(2, 6)
+    output = _scatter_position_ids_to_sequence_parallel_region(position_ids)
+
+    assert torch.equal(output, position_ids[:, ::2])
+
+
+def test_scatter_position_ids_3d_matches_sequence_parallel_layout(monkeypatch):
+    def _fake_scatter(x):
+        return x[1::2].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.bridge.models.qwen_omni.modeling_qwen3_omni.thinker_model.tensor_parallel.scatter_to_sequence_parallel_region",
+        _fake_scatter,
+    )
+
+    position_ids = torch.arange(3 * 2 * 6).view(3, 2, 6)
+    output = _scatter_position_ids_to_sequence_parallel_region(position_ids)
+
+    assert output.shape == (3, 2, 3)
+    assert torch.equal(output, position_ids[:, :, 1::2])
+
+
+def test_scatter_position_ids_rejects_bad_rank():
+    with pytest.raises(ValueError, match="Unsupported Qwen3-Omni position_ids shape"):
+        _scatter_position_ids_to_sequence_parallel_region(torch.zeros(1, 2, 3, 4))
 
 
 class TestQwen3OmniModel:

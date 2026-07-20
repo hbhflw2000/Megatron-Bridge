@@ -19,7 +19,6 @@ from typing import List, Literal, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import transformer_engine.pytorch as te
 from megatron.core import parallel_state
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
@@ -44,9 +43,11 @@ from megatron.bridge.peft.utils import (
     is_grouped_expert_linear,
     is_modelopt_linear,
 )
+from megatron.bridge.utils.import_utils import safe_import
 
 
 logger = logging.getLogger(__name__)
+te, HAVE_TE = safe_import("transformer_engine.pytorch")
 
 try:
     import bitsandbytes
@@ -121,13 +122,16 @@ class LoRA(PEFT, ModuleMatcher):
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
         # Skip already transformed modules
-        adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter, TELinearAdapter)
+        adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter)
+        if HAVE_TE:
+            adapter_types = adapter_types + (TELinearAdapter,)
         if isinstance(module, adapter_types):
             return module
 
         if (ans := self.match(module, name, prefix)) is not None:
             _, full_name = ans
-            if (isinstance(module, nn.Linear) or (module.__class__ == te.Linear)) and not is_modelopt_linear(module):
+            is_te_linear = HAVE_TE and module.__class__ == te.Linear
+            if (isinstance(module, nn.Linear) or is_te_linear) and not is_modelopt_linear(module):
                 # Will use the `patch_linear_module` function if:
                 # - is FSDP v1
                 # - is DTensor (has _local_tensor attribute)
@@ -138,7 +142,7 @@ class LoRA(PEFT, ModuleMatcher):
                     and module.quant_state.__class__ == bitsandbytes.functional.QuantState
                 ):
                     lora_cls = patch_linear_module
-                elif module.__class__ == te.Linear:
+                elif is_te_linear:
                     lora_cls = TELinearAdapter
                 else:
                     lora_cls = LinearAdapter
@@ -168,7 +172,8 @@ class LoRA(PEFT, ModuleMatcher):
             use_per_expert_adapter = is_grouped_expert_linear(full_name) and not self.share_expert_adapters
 
             enable_op_fuser = (
-                not use_per_expert_adapter
+                HAVE_TE
+                and not use_per_expert_adapter
                 and not is_expert
                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
                 # TP not yet supported
